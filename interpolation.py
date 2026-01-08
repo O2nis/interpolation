@@ -1,143 +1,264 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+from scipy.interpolate import pchip_interpolate
+import plotly.graph_objects as go
+from io import BytesIO
+from datetime import datetime, timedelta
 
-def main():
-    st.title("Interpolation App")
+# Set page config
+st.set_page_config(
+    page_title="TimeSeries Resampling Tool",
+    page_icon="⏱️",
+    layout="wide"
+)
 
-    # Step 1: File upload
-    uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
-    if uploaded_file is None:
-        st.warning("Please upload a CSV file with at least one column named 'Load'.")
-        return
+# --- Helper Functions ---
 
-    # Frequency options
-    freq_input_map = {
-        "1 hour": "H",
-        "30 minutes": "30min",
-        "15 minutes": "15min",
-        "10 minutes": "10min",
+@st.cache_data
+def load_data(file):
+    """Loads CSV or Excel file."""
+    try:
+        if file.name.endswith('.csv'):
+            df = pd.read_csv(file)
+        else:
+            df = pd.read_excel(file)
+        return df
+    except Exception as e:
+        st.error(f"Error loading file: {e}")
+        return None
+
+@st.cache_data
+def process_data(_df, start_datetime, input_freq_str, output_freq_str, selected_cols):
+    """
+    Performs resampling and interpolation.
+    Wrapped in @st.cache_data to prevent re-calculating on download.
+    """
+    # Mapping frequency strings
+    freq_map = {
+        'seconds': 'S',
+        'minute': 'T',
+        '15 minutes': '15T',
+        'hourly': 'H'
     }
-    freq_output_map = {
-        "15 minutes": "15min",
-        "10 minutes": "10min",
-        "1 minute": "T",
-    }
+    
+    in_freq = freq_map.get(input_freq_str, 'T')
+    out_freq = freq_map.get(output_freq_str, 'H')
+    
+    # 1. Construct Original Dataframe with Datetime Index
+    # Create index based on start time and row count
+    original_index = pd.date_range(start=start_datetime, periods=len(_df), freq=in_freq)
+    df_orig = _df.copy()
+    df_orig.index = original_index
+    
+    # Ensure numeric
+    for col in selected_cols:
+        df_orig[col] = pd.to_numeric(df_orig[col], errors='coerce')
 
-    # Step 2: Choose input frequency
-    st.header("Select Input Time Step")
-    selected_input_freq_label = st.selectbox(
-        "Input frequency:",
-        list(freq_input_map.keys()),
-        index=0
-    )
-    selected_input_freq = freq_input_map[selected_input_freq_label]
+    # 2. Create Output Range
+    full_range = pd.date_range(start=df_orig.index.min(), end=df_orig.index.max(), freq=out_freq)
+    
+    results = {}
+    
+    # 3. Interpolate
+    for method in ['Linear', 'PCHIP']:
+        df_resampled = pd.DataFrame(index=full_range)
+        
+        for col in selected_cols:
+            series = df_orig[col].dropna()
+            
+            if len(series) < 2:
+                df_resampled[col] = np.nan
+                continue
 
-    # Step 3: Choose output frequency
-    st.header("Select Output Time Step")
-    selected_output_freq_label = st.selectbox(
-        "Output frequency:",
-        list(freq_output_map.keys()),
-        index=0
-    )
-    selected_output_freq = freq_output_map[selected_output_freq_label]
+            if method == 'Linear':
+                temp = series.reindex(full_range)
+                df_resampled[col] = temp.interpolate(method='linear')
+                
+            elif method == 'PCHIP':
+                x_original = series.index.astype(np.int64)
+                y_original = series.values
+                x_new = full_range.astype(np.int64)
+                y_pchip = pchip_interpolate(x_original, y_original, x_new)
+                df_resampled[col] = y_pchip
+        
+        results[method] = df_resampled
 
-    # Read data into DataFrame
-    data = pd.read_csv(uploaded_file)
+    return df_orig, results
 
-    # Quick validation: ensure 'Load' column exists
-    if 'Load' not in data.columns:
-        st.error("Your CSV must contain a column named 'Load'. Please try again.")
-        return
+# --- Streamlit UI ---
 
-    # STEP 4: Interpret the input data according to the selected input frequency.
-    #         We'll assume the CSV rows represent consecutive samples at the given frequency.
-    #         Create a DateTimeIndex from a fixed start time, set it as the DataFrame index.
-    n_rows = len(data)
-    start_time = pd.to_datetime("2020-01-01 00:00:00")
-    input_index = pd.date_range(start=start_time, periods=n_rows, freq=selected_input_freq)
-    data.index = input_index
+st.title("⏱️ TimeSeries Resampling & Interpolation")
+st.markdown("""
+Upload a file. The app generates a timeline from your selected Start Date.
+Visualize a **specific 24-hour period** to compare interpolation accuracy.
+""")
 
-    # Now reindex to the selected output frequency
-    output_index = pd.date_range(start=data.index[0], end=data.index[-1], freq=selected_output_freq)
-    data_reindexed = data.reindex(output_index)
+# 1. Sidebar Configuration
+st.sidebar.header("Configuration")
 
-    # Perform interpolations
-    linear_interpolated = data_reindexed.interpolate(method='linear')
-    spline_interpolated = data_reindexed.interpolate(method='spline', order=3)
-    pchip_interpolated = data_reindexed.interpolate(method='pchip')
+uploaded_file = st.sidebar.file_uploader("Upload Excel or CSV", type=["csv", "xlsx", "xls"])
 
-    # Save interpolated data to CSV with filenames that reflect the chosen output freq
-    linear_file_name = f"linear_interpolated_{selected_output_freq_label.replace(' ', '')}.csv"
-    spline_file_name = f"spline_interpolated_{selected_output_freq_label.replace(' ', '')}.csv"
-    pchip_file_name = f"pchip_interpolated_{selected_output_freq_label.replace(' ', '')}.csv"
+if uploaded_file:
+    df = load_data(uploaded_file)
+    
+    if df is not None:
+        st.subheader("Raw Data Preview")
+        st.dataframe(df.head())
+        
+        # --- Timeline Settings ---
+        st.sidebar.subheader("1. Timeline Definition")
+        default_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        start_date = st.sidebar.date_input("Start Date (Row 1)", value=default_start.date())
+        start_time = st.sidebar.time_input("Start Time (Row 1)", value=default_start.time())
+        start_datetime = datetime.combine(start_date, start_time)
+        
+        # --- Frequency Settings ---
+        st.sidebar.subheader("2. Frequency Settings")
+        timestep_options = ["seconds", "minute", "15 minutes", "hourly"]
+        
+        input_timestep = st.sidebar.selectbox("Input Frequency (File Timestep)", timestep_options, index=2)
+        output_timestep = st.sidebar.selectbox("Output Target Frequency", timestep_options, index=3)
+        
+        # --- Column Selection ---
+        st.sidebar.subheader("3. Data Columns")
+        all_cols = df.columns.tolist()
+        selected_cols = st.sidebar.multiselect("Select Columns", all_cols, default=all_cols)
+        
+        # --- Process Button ---
+        process_btn = st.sidebar.button("Elaborate Data")
+        
+        if process_btn or 'processed_data' in st.session_state:
+            # Check if we need to process or if we can use session state (though caching handles the heavy lifting)
+            
+            # Perform processing (Cached)
+            df_orig, resampled_results = process_data(df, start_datetime, input_timestep, output_timestep, selected_cols)
+            
+            # Store in session state to avoid re-running logic if inputs haven't changed (though caching is the main fix)
+            st.session_state['processed_data'] = resampled_results
+            st.session_state['orig_data'] = df_orig
+            
+            st.success("Processing Complete! (Cached)")
+            
+            # --- Visualization Section ---
+            st.header("24-Hour Analysis Comparison")
+            
+            # Determine Min/Max date available
+            min_date = df_orig.index.min().date()
+            max_date = df_orig.index.max().date()
+            
+            # Widget to select the specific 24h period
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                analysis_date = st.date_input(
+                    "Select a Day to Analyze (24h Window)", 
+                    value=min_date, 
+                    min_value=min_date, 
+                    max_value=max_date
+                )
+            
+            with col2:
+                st.write("")
+                st.write(f"**Date Range:** {min_date} to {max_date}")
+            
+            # Filter data for the selected day
+            start_of_day = datetime.combine(analysis_date, datetime.min.time())
+            end_of_day = datetime.combine(analysis_date, datetime.max.time())
+            
+            # We need to reindex Original data to Output Frequency to compare apples to apples on the chart
+            # (Or we just plot markers for original and lines for resampled)
+            # Let's plot the resampled data primarily, and the original as a reference if it falls on the same grid,
+            # or just plot the original values as scatter points to show where data came from.
+            
+            for col in selected_cols:
+                st.subheader(f"Analysis for: {col}")
+                
+                # Create a DataFrame for the specific day containing all methods
+                # Note: Original data might not have points for every output timestep, so we handle it carefully.
+                
+                # 1. Get Resampled Data for this day
+                df_linear_day = resampled_results['Linear'].loc[start_of_day:end_of_day]
+                df_pchip_day = resampled_results['PCHIP'].loc[start_of_day:end_of_day]
+                
+                # 2. Get Original Data for this day (Scatter)
+                mask = (df_orig.index >= start_of_day) & (df_orig.index <= end_of_day)
+                df_orig_day = df_orig.loc[mask]
+                
+                # 3. Calculate Daily Average Metrics for this day
+                avg_orig = df_orig_day[col].mean()
+                avg_linear = df_linear_day[col].mean()
+                avg_pchip = df_pchip_day[col].mean()
+                
+                # Display Metrics
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Original Daily Avg", f"{avg_orig:.2f}")
+                m2.metric("Linear Daily Avg", f"{avg_linear:.2f}", delta=f"{avg_linear - avg_orig:.2f}")
+                m3.metric("PCHIP Daily Avg", f"{avg_pchip:.2f}", delta=f"{avg_pchip - avg_orig:.2f}")
+                
+                # 4. Plotting
+                fig = go.Figure()
+                
+                # Plot Original as Scatter (Markers only)
+                fig.add_trace(go.Scatter(
+                    x=df_orig_day.index, y=df_orig_day[col], 
+                    mode='markers', name='Original Data', 
+                    marker=dict(color='black', size=6)
+                ))
+                
+                # Plot Linear
+                fig.add_trace(go.Scatter(
+                    x=df_linear_day.index, y=df_linear_day[col], 
+                    mode='lines', name='Linear Interp', 
+                    line=dict(color='blue')
+                ))
+                
+                # Plot PCHIP
+                fig.add_trace(go.Scatter(
+                    x=df_pchip_day.index, y=df_pchip_day[col], 
+                    mode='lines', name='PCHIP Interp', 
+                    line=dict(color='red', dash='dot')
+                ))
+                
+                fig.update_layout(
+                    title=f"24-Hour Profile: {col}", 
+                    xaxis_title="Time", 
+                    yaxis_title="Value",
+                    hovermode='x unified'
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # --- Output 2: Full Resampled Data Preview ---
+            with st.expander("Preview Full Resampled Data (PCHIP)"):
+                st.dataframe(resampled_results['PCHIP'])
+            
+            # --- Output 3: CSV Download ---
+            st.header("Download Results")
+            
+            # Prepare CSV (Combined)
+            # We only include Linear and PCHIP in download to keep file size reasonable, 
+            # or we include Original if reindexed. Let's stick to resampled results.
+            download_list = []
+            for method, data in resampled_results.items():
+                df_dl = data.copy()
+                df_dl.columns = [f"{c} ({method})" for c in df_dl.columns]
+                download_list.append(df_dl)
+            
+            final_download = pd.concat(download_list, axis=1)
+            final_download.index.name = "Timestamp"
+            final_download.reset_index(inplace=True)
+            
+            # Convert to CSV buffer
+            buffer = BytesIO()
+            final_download.to_csv(buffer, index=False)
+            buffer.seek(0)
+            
+            st.download_button(
+                label="Download Interpolated Data (CSV)",
+                data=buffer,
+                file_name=f"interpolated_data_{analysis_date}.csv",
+                mime="text/csv"
+            )
 
-    # Provide downloads
-    st.header("Download Interpolated CSVs")
-    st.download_button(
-        label=f"Download {linear_file_name}",
-        data=linear_interpolated.to_csv(),
-        file_name=linear_file_name,
-        mime="text/csv"
-    )
-    st.download_button(
-        label=f"Download {spline_file_name}",
-        data=spline_interpolated.to_csv(),
-        file_name=spline_file_name,
-        mime="text/csv"
-    )
-    st.download_button(
-        label=f"Download {pchip_file_name}",
-        data=pchip_interpolated.to_csv(),
-        file_name=pchip_file_name,
-        mime="text/csv"
-    )
-
-    # STEP 5: Compute differences
-    difference_spline_linear = spline_interpolated['Load'] - linear_interpolated['Load']
-    difference_pchip_linear = pchip_interpolated['Load'] - linear_interpolated['Load']
-    difference_spline_pchip = spline_interpolated['Load'] - pchip_interpolated['Load']
-
-    # STEP 6: Plot original vs interpolated in the first 24 hours
-    st.header("Charts for the First 24 Hours")
-    zoom_end = start_time + pd.Timedelta(hours=24)
-
-    # Slice the data for the first 24 hours
-    data_zoom = data.loc[start_time:zoom_end]
-    linear_zoom = linear_interpolated.loc[start_time:zoom_end]
-    spline_zoom = spline_interpolated.loc[start_time:zoom_end]
-    pchip_zoom = pchip_interpolated.loc[start_time:zoom_end]
-
-    # Plot original data and interpolations
-    fig1, ax1 = plt.subplots(figsize=(10, 5))
-    ax1.plot(data_zoom.index, data_zoom['Load'], 'o', label='Original Data', markersize=4)
-    ax1.plot(linear_zoom.index, linear_zoom['Load'], label='Linear Interpolation')
-    ax1.plot(spline_zoom.index, spline_zoom['Load'], label='Spline Interpolation')
-    ax1.plot(pchip_zoom.index, pchip_zoom['Load'], label='PCHIP Interpolation')
-    ax1.set_xlabel('Time')
-    ax1.set_ylabel('Load (MW)')
-    ax1.set_title('Comparison of Interpolation Methods (First 24 Hours)')
-    ax1.legend()
-    st.pyplot(fig1)
-
-    # Plot the differences
-    fig2, ax2 = plt.subplots(figsize=(10, 5))
-    ax2.plot(difference_spline_linear.loc[start_time:zoom_end].index,
-             difference_spline_linear.loc[start_time:zoom_end],
-             label='Spline - Linear')
-    ax2.plot(difference_pchip_linear.loc[start_time:zoom_end].index,
-             difference_pchip_linear.loc[start_time:zoom_end],
-             label='PCHIP - Linear')
-    ax2.plot(difference_spline_pchip.loc[start_time:zoom_end].index,
-             difference_spline_pchip.loc[start_time:zoom_end],
-             label='Spline - PCHIP')
-    ax2.set_xlabel('Time')
-    ax2.set_ylabel('Load Difference (MW)')
-    ax2.set_title('Differences Between Interpolation Methods (First 24 Hours)')
-    ax2.legend()
-    st.pyplot(fig2)
-
-
-if __name__ == "__main__":
-    main()
+else:
+    st.info("👈 Please upload a file via the sidebar to begin.")
